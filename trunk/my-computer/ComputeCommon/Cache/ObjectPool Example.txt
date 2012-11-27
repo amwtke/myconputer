@@ -1,0 +1,447 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using IICSmsaSingaporePhoneNOConvert.DB;
+
+namespace IICSmsaSingaporePhoneNOConvert
+{
+    public interface IConvertor : IICSmsaSingaporePhoneNOConvert.Cache.IObjectPoolMethods//ObjectPool接口要包含在对象的实现中！
+    {
+        void Initialize();//Initialize the component
+        IDBModel Convert();// Algorithm of convert No.
+        void ResoursesClean(); //Release resources component holds
+    }
+
+    public enum ConvertorDirection
+    {
+        MT,
+        MO
+    }
+
+    public enum ConvertorType
+    {
+        LinearIncreamentConvertor,
+    }
+}
+
+
+
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using IICSmsaSingaporePhoneNOConvert;
+using IICSmsaSingaporePhoneNOConvert.DB;
+using IICSmsaSingaporePhoneNOConvert.Cache;
+using IICSmsaSingaporePhoneNOConvert.Configuration;
+using Imps.Services.CommonV4;
+
+namespace IICSmsaSingaporePhoneNOConvert.Convertors
+{
+    public class LinearIncreamentConvertor : ConvertorFactory, IConvertor
+    {
+        #region Private Static Filed Member
+
+        private static ITracing _tracer = TracingManager.GetTracing(typeof(LinearIncreamentConvertor));
+        static string ClassName = "LinearIncreamentConvertor";
+        static bool isFirstLoaded = true;
+        static string Configkey = ConvertorConfig.Current.ConvertorCollection[ClassName].CacheName;
+        static LRUCache<IDBModel> _cache = LruCacheManager.Caches[Configkey];
+        static LRUCache<IDBModel>.IIndex<string> _index = LruCacheManager.Indexs[Configkey];
+        static IDBOperation _db = LruCacheManager.DbOperationClass[Configkey];
+        static string indexName = ConvertorConfig.Current.LRUCacheCollection[Configkey].IndexName;
+
+        #endregion
+
+        //No. to convert
+         Int64 _chinaNO;
+         Int64 _SingNo;
+         ConvertorDirection _dir;
+        //static string _map;
+         string _subNo;
+         string _spNo;
+
+         SingaporeMobileMappingDL _data;
+
+
+        #region IConvertor Members
+
+        public LinearIncreamentConvertor(string srcNo, string destNo, ConvertorDirection dir)
+        {
+            if (srcNo != null && srcNo.Length > 0 && destNo != null && destNo.Length > 0)
+                InputData(srcNo, destNo, dir);
+            else
+                throw new Exception(ClassName + " initialized failure!");
+        }
+        public LinearIncreamentConvertor() {}
+
+        public void Initialize()
+        {
+            /*
+             * 如果不清空除开当前使用的spno则会造成 key=SingaporeMobleNo+Map的重复的bug。
+             * 出现情况是：聊天信息。没有做冲突检测，因为map的生成是11位到10位的映射
+             * 不会出现重复。可以提高效率！
+             */
+            if (isFirstLoaded)
+            {
+                LruCacheManager.DbOperationClass[Configkey].DeleteSpnoExceptThisOne(ConvertorConfig.Current.ConvertorCollection[ClassName].SPNo);
+                isFirstLoaded = false;
+            }
+        }
+
+        /// <summary>
+        /// No. returned.
+        /// </summary>
+        /// <returns></returns>
+        public IDBModel Convert()
+        {   
+            try
+            {
+                if (_dir.Equals(ConvertorDirection.MO))
+                {
+                    //查缓存或者查表
+                    //_data = LruCacheManager.Caches[Configkey].GetIndex<string>(ConvertorConfig.Current.LRUCacheCollection[//_index[ConvertorConfig.Current.LRUCache.IndexName, _data.Key];
+                    if (LruCacheManager.Indexs.ContainsKey(Configkey))
+                    {
+                        _data = _index[ConvertorConfig.Current.LRUCacheCollection[Configkey].IndexName, _data.Key] as SingaporeMobileMappingDL;
+                    }
+                }
+                else//(_dir.Equals(Direction.MT))
+                {
+                    string map = Configuration.ConvertorConfig.Current.ConvertorCollection[ClassName].ForeignSPNo + MTConvert();
+                    _data.Map = map;
+
+                    //insert db
+                    if (GenMapWhenConflict())
+                    {
+                        if (_db.Add(_data) != 1)
+                        {
+                            throw new Exception("Dump insert After UnConflict Operation!");
+                        }
+
+                        //insert cache
+                        //保持cache中又数据库中必然有
+                        _cache.AddItem(indexName, _data);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                _tracer.ErrorFmt(e, ClassName + " Convertor() Failure!");
+            }
+
+            return _data;
+        }
+
+        public void ResoursesClean()
+        {
+            //throw new NotImplementedException();
+        }
+
+        #endregion
+
+        #region MT转换算法
+        /// <summary>
+        /// MT转换算法
+        /// 返回中国号码转换后的Map号码
+        /// 共10个数字
+        /// </summary>
+        /// <returns></returns>
+        private string MTConvert()
+        {
+            string TotalNo;
+
+            /*当12520+034情况出现时
+             * 应该不应该加入chinamobileNO
+             * 否则会多出一个0。
+             */
+            if (_data.ChinaMobileNo != 0L)
+                TotalNo = _data.SPNo.Trim() + _data.SubNo.Trim() + _data.ChinaMobileNo.ToString().Trim();
+            else
+                TotalNo = _data.SPNo.Trim() + _data.SubNo.Trim();
+
+            StringBuilder sb = new StringBuilder(TotalNo);
+            int DigitsRequired = ConvertorConfig.Current.ConvertorCollection[ClassName].TotalDigitsAfterCompress;
+
+            if (TotalNo.Trim().StartsWith(_data.SPNo))
+            {
+                //长度不够补0 
+                //长度超出了从后面截断
+                if (TotalNo.Length <= DigitsRequired)
+                {
+                    int i = TotalNo.Length;
+
+                    for (; i < DigitsRequired; i++)
+                    {
+                        sb.Append(ConvertorConfig.Current.ConvertorCollection[ClassName].Complement);
+                    }
+                }
+                else
+                {
+                    /*
+                     *从头开始截断
+                     *避免冲突从头以后开始截断
+                     * 如：74167402613512345678 -> 123456=>Map=7416743522200790
+                     * 如果截断子号码则可能出现聊天信息与加好友信息对应到相同的Map上；
+                     * 74167413512345678 ->123456 =>7416743522200790
+                     * 
+                     * 
+                     * MobileNo+子号码：冲突概率10^7； 不加子号码10^10不冲突
+                     * Sid+子号码：冲突概率无；  不加子号码 无。
+                    */
+                    if (!ConvertorConfig.Current.ConvertorCollection[ClassName].CompressSubNoAndSPNo)
+                    {
+                        //统一从头开始截断！
+                        sb.Remove(DigitsRequired, sb.ToString().Length - DigitsRequired);
+                    }
+                    else
+                    {
+                        //从SPNo开始从头截断,能最大限度减少冲突。
+                        sb.Remove(0, sb.ToString().Length - DigitsRequired);//cut SpNo+SubNo 
+
+                        //判断是否有子号码
+                        if (_data.SubNo != null && _data.SubNo.Length > 0)
+                        {
+                            //如果有子号码 为了防止上面注释中出现的情况
+                            //将子号码代替352部分：7416743522200790-》7416740262200790（子号码 026）
+                            //避免聊天信息跟加好友信息map到一个号码上。
+                            //如果不加字号码加好友与聊天必然冲突一次。加了字号码虽然
+                            //冲突概率增加，但是冲突反而会不常见，有利于提高效率。
+                            //所以保留子号码。
+                            if (!(_data.ChinaMobileNo.ToString().Length < 11))//不是飞信号
+                            {
+                                //保留子号码
+                                //0XX打头 1百万的冲突几率,子号码0XX 天然避免越界
+                                sb.Remove(0, 3); sb.Insert(0, _data.SubNo.Substring(0, 3));
+                            }
+                            else
+                            {
+                                //可以不保留子号码0+9位 与子号码最后一位+9位 所以不会映射成一样的号码！
+                                //为了防止以后子号码变化带来的不可预料的后果
+                                sb.Remove(0, 1); sb.Insert(0, "0");//有子号码强制将高位改成0 避免越界
+                            }
+                        }
+                        else//没有子号码 手机号码11位保留10位3XXXX满足要求，飞信号9位，XSId可能会大于3XXXX的要求
+                        {
+                            if (_data.ChinaMobileNo.ToString().Length < 11)
+                            {
+                                sb.Remove(0, 1); sb.Insert(0, "3");//没子号码强制将高位改成3 避免越界
+                            }
+                            else
+                            {
+                                //12520+135XXXXXX.所以应该是以3开头。
+                                sb.Remove(0, 1); sb.Insert(0, "3");//不是3强制将高位改成3
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                throw new Exception("Not suport Service No. " + TotalNo);
+            }
+
+            if(!this.IsMappingAvailible(System.Convert.ToInt64(sb.ToString().Trim())))
+                throw new Exception("Map No. is not avalible check the value!");
+
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 当冲突发生的时候，统一取map的后4位+1
+        /// 形成新的map 输出
+        /// 
+        /// 可能带来效率问题！
+        /// </summary>
+        private bool GenMapWhenConflict()
+        {
+            int temp = 0;
+            bool needInsert = false;
+            StringBuilder sb = new StringBuilder(_data.Map);
+            IDBModel tempData = null;
+
+            //当所有数据属性一样的情况下，不需要更新数据库（+1操作）
+            //只有当singapore+map号对应两个china号码+sub+sp的时候说明冲突发生了。
+            //才做更新！节约CUP时间！
+            //例如：
+            //13522222222->1111111 与13512222222->1111111
+
+            /*一个号码第一次进入判断是不需要检测是否冲突的
+             * 用LruCache读取，提高速度。
+             * 如果cache中没有数据库中有的话会抛出异常信息！
+             */
+            tempData = _index[ConvertorConfig.Current.LRUCacheCollection[Configkey].IndexName, _data.Key] as SingaporeMobileMappingDL;
+            if (tempData == null)
+                return true;
+
+
+            /*停止while的有两个情况
+             * 1、tempdata为空，此时needInsert必然TRUE，表示一定要插入这个冲突元素；
+             * 2、数据库中存在一样的值，此时needInsert依然为FALSE，表示不要重复插入一个已经存在的值。否则会抛出重复插入的数据库异常！
+             */
+            while (tempData!=null)
+            {
+                if (_data.ChinaMobileNo != tempData.ChinaMobileNo || _data.SubNo != tempData.SubNo || _data.SPNo != tempData.SPNo)
+                {
+                    //取最后4位做加1更新
+                    temp = System.Convert.ToInt32(_data.Map.Substring(_data.Map.Length - 4, 4));
+                    temp++;
+                    sb.Remove(_data.Map.Length - 4, 4);
+                    sb.Append(temp.ToString());
+                    _data.Map = sb.ToString().Trim();
+                    needInsert = true;
+
+                    tempData = _index[ConvertorConfig.Current.LRUCacheCollection[Configkey].IndexName, _data.Key] as SingaporeMobileMappingDL;
+                }
+                else
+                {
+                    needInsert = false;
+                    break;
+                }
+            }
+
+            return needInsert;
+        }
+
+        #endregion
+
+        #region Object Pool Interface implementation
+
+        void IObjectPoolMethods.SetupObject(params object[] setupParameters)\\接口1！！！！
+        {
+            string srcNo = setupParameters[0].ToString();
+            string destNo = setupParameters[1].ToString();
+            _dir = (ConvertorDirection)setupParameters[2];
+
+            if (srcNo != null && srcNo.Length > 0 && destNo != null && destNo.Length > 0)
+                InputData(srcNo, destNo, _dir);
+            else
+                throw new Exception("LinearIncreamentConvertor initialized failure!");
+        }
+
+        /// <summary>
+        /// 填充数据
+        /// 初始化对象时调用
+        /// </summary>
+        /// <param name="srcNo"></param>
+        /// <param name="destNo"></param>
+        /// <param name="dir"></param>
+        void InputData(string srcNo, string destNo, ConvertorDirection dir)
+        {
+            if (_dir.Equals(ConvertorDirection.MO))
+            {
+                _SingNo = System.Convert.ToInt64(srcNo.Trim());
+
+                _data = new SingaporeMobileMappingDL(_SingNo, -1L, destNo, string.Empty, string.Empty);
+            }
+
+            if (_dir.Equals(ConvertorDirection.MT))
+            {
+                //得到SP号码。
+                _spNo = srcNo.Trim().Substring(0, ConvertorConfig.Current.ConvertorCollection[ClassName].SPNo.Length);
+                if (!_spNo.Equals(ConvertorConfig.Current.ConvertorCollection[ClassName].SPNo))
+                {
+                    throw new Exception("Error SrcNo of MT message: srcNo.=" + srcNo + " destNo=" + destNo + " Right SPNo:" + ConvertorConfig.Current.ConvertorCollection[ClassName].SPNo + " But now is:" + _spNo);
+                }
+                
+                //得到子号码
+                //判断子号码
+                //子号码3位
+                //12520	0	发送到服务号码，根据消息内容判断功能 要排除！
+                if (!srcNo.Equals(ConvertorConfig.Current.ConvertorCollection[ClassName].SPNo) && srcNo.ToCharArray()[_spNo.Length] == '0')
+                {
+                    _subNo = srcNo.Trim().Substring(0 + ConvertorConfig.Current.ConvertorCollection[ClassName].SPNo.Length, 3);
+                }
+                else
+                {
+                    _subNo = string.Empty;
+                }
+
+                //得到中国手机号
+                //12520	0	发送到服务号码，根据消息内容判断功能 要排除！
+                if (!srcNo.Equals(ConvertorConfig.Current.ConvertorCollection[ClassName].SPNo))
+                {
+                    //纯字号码
+                    //支持所有的子号码
+                    //如果是12520+0XX则china号为0L；否则保留后面的数字。
+                    if (srcNo.Trim().Length == _spNo.Trim().Length + _subNo.Trim().Length)
+                        _chinaNO = 0L;
+                    else
+                        //正常SPno+subNO+11为手机号orsid。
+                        _chinaNO = System.Convert.ToInt64(srcNo.Substring(_spNo.Length + _subNo.Length, srcNo.Length - _spNo.Length - _subNo.Length).Trim());
+                }
+                else
+                    //纯12520SPNO。
+                    _chinaNO = 0L;
+
+                _data = new SingaporeMobileMappingDL(System.Convert.ToInt64(destNo.Trim()), _chinaNO, string.Empty, _spNo, _subNo);
+            }
+        }
+
+        //public event EventHandler Disposing;
+        public event EventHandler Disposing;\\接口2！！！！
+
+        #region IDisposable Members
+
+        //GC will do finallize
+        ~LinearIncreamentConvertor()\\必须的东西！！！！
+        {
+            Dispose();
+        }
+        public void Dispose()
+        {
+            if (Disposing != null)
+            {
+                Disposing(new LinearIncreamentConvertor(), new EventArgs()); \\接口2必须的！在销毁一个时 重新创建的接口！！！
+                //Disposing(Activator.CreateInstance(Type.GetType(ClassName),null), new EventArgs()); 
+            }
+        }
+
+        #endregion
+
+        public static LinearIncreamentConvertor GetObject(params object[] setupParameters)
+        {
+            if (setupParameters != null && setupParameters.Length == 3)
+            {
+                return ObjectPool<LinearIncreamentConvertor>.GetInstance().GetObjectFromPool(setupParameters);
+            }
+
+            return null;
+        }
+
+        #endregion
+    }
+}
+
+
+
+//params的使用!!!!
+// keywords_params.cs
+
+using System;
+
+class App
+{
+    public static void UseParams(params object[] list)
+    {
+        for (int i = 0; i < list.Length; i++)
+        {
+            Console.WriteLine(list[i]);
+        }
+    }
+
+    static void Main()
+    {
+        // 一般做法是先构造一个对象数组，然后将此数组作为方法的参数
+        object[] arr = new object[3] { 100, 'a', "keywords" };
+        UseParams(arr);
+
+        // 而使用了params修饰方法参数后，我们可以直接使用一组对象作为参数
+        // 当然这组参数需要符合调用的方法对参数的要求
+        UseParams(100, 'a', "keywords");
+
+        Console.Read();
+    }
+}
